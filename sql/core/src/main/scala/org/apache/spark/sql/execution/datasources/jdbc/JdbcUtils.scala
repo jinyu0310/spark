@@ -18,7 +18,6 @@
 package org.apache.spark.sql.execution.datasources.jdbc
 
 import java.sql.{Connection, Driver, DriverManager, PreparedStatement, ResultSet, ResultSetMetaData, SQLException}
-import java.util.Properties
 
 import scala.collection.JavaConverters._
 import scala.util.Try
@@ -41,27 +40,13 @@ import org.apache.spark.util.NextIterator
  * Util functions for JDBC tables.
  */
 object JdbcUtils extends Logging {
-
-  // the property names are case sensitive
-  val JDBC_BATCH_FETCH_SIZE = "fetchsize"
-  val JDBC_BATCH_INSERT_SIZE = "batchsize"
-  val JDBC_TXN_ISOLATION_LEVEL = "isolationLevel"
-
   /**
    * Returns a factory for creating connections to the given JDBC URL.
    *
-   * @param url the JDBC url to connect to.
-   * @param properties JDBC connection properties.
+   * @param options - JDBC options that contains url, table and other information.
    */
-  def createConnectionFactory(url: String, properties: Properties): () => Connection = {
-    val userSpecifiedDriverClass = Option(properties.getProperty("driver"))
-    userSpecifiedDriverClass.foreach(DriverRegistry.register)
-    // Performing this part of the logic on the driver guards against the corner-case where the
-    // driver returned for a URL is different on the driver and executors due to classpath
-    // differences.
-    val driverClass: String = userSpecifiedDriverClass.getOrElse {
-      DriverManager.getDriver(url).getClass.getCanonicalName
-    }
+  def createConnectionFactory(options: JDBCOptions): () => Connection = {
+    val driverClass: String = options.driverClass
     () => {
       DriverRegistry.register(driverClass)
       val driver: Driver = DriverManager.getDrivers.asScala.collectFirst {
@@ -71,7 +56,7 @@ object JdbcUtils extends Logging {
         throw new IllegalStateException(
           s"Did not find registered driver with class $driverClass")
       }
-      driver.connect(url, properties)
+      driver.connect(options.url, options.asConnectionProperties)
     }
   }
 
@@ -550,10 +535,6 @@ object JdbcUtils extends Logging {
       batchSize: Int,
       dialect: JdbcDialect,
       isolationLevel: Int): Iterator[Byte] = {
-    require(batchSize >= 1,
-      s"Invalid value `${batchSize.toString}` for parameter " +
-      s"`$JDBC_BATCH_INSERT_SIZE`. The minimum value is 1.")
-
     val conn = getConnection()
     var committed = false
 
@@ -626,7 +607,7 @@ object JdbcUtils extends Logging {
     } catch {
       case e: SQLException =>
         val cause = e.getNextException
-        if (e.getCause != cause) {
+        if (cause != null && e.getCause != cause) {
           if (e.getCause == null) {
             e.initCause(cause)
           } else {
@@ -676,24 +657,24 @@ object JdbcUtils extends Logging {
       df: DataFrame,
       url: String,
       table: String,
-      properties: Properties) {
+      options: JDBCOptions): Unit = {
     val dialect = JdbcDialects.get(url)
     val nullTypes: Array[Int] = df.schema.fields.map { field =>
       getJdbcType(field.dataType, dialect).jdbcNullType
     }
 
     val rddSchema = df.schema
-    val getConnection: () => Connection = createConnectionFactory(url, properties)
-    val batchSize = properties.getProperty(JDBC_BATCH_INSERT_SIZE, "1000").toInt
-    val isolationLevel =
-      properties.getProperty(JDBC_TXN_ISOLATION_LEVEL, "READ_UNCOMMITTED") match {
-        case "NONE" => Connection.TRANSACTION_NONE
-        case "READ_UNCOMMITTED" => Connection.TRANSACTION_READ_UNCOMMITTED
-        case "READ_COMMITTED" => Connection.TRANSACTION_READ_COMMITTED
-        case "REPEATABLE_READ" => Connection.TRANSACTION_REPEATABLE_READ
-        case "SERIALIZABLE" => Connection.TRANSACTION_SERIALIZABLE
-      }
-    df.foreachPartition(iterator => savePartition(
+    val getConnection: () => Connection = createConnectionFactory(options)
+    val batchSize = options.batchSize
+    val isolationLevel = options.isolationLevel
+    val repartitionedDF = options.numPartitions match {
+      case Some(n) if n <= 0 => throw new IllegalArgumentException(
+        s"Invalid value `$n` for parameter `${JDBCOptions.JDBC_NUM_PARTITIONS}` in table writing " +
+          "via JDBC. The minimum value is 1.")
+      case Some(n) if n < df.rdd.getNumPartitions => df.coalesce(n)
+      case _ => df
+    }
+    repartitionedDF.foreachPartition(iterator => savePartition(
       getConnection, table, iterator, rddSchema, nullTypes, batchSize, dialect, isolationLevel)
     )
   }

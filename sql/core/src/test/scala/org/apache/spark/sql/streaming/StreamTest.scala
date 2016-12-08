@@ -28,6 +28,7 @@ import scala.util.control.NonFatal
 
 import org.scalatest.Assertions
 import org.scalatest.concurrent.{Eventually, Timeouts}
+import org.scalatest.concurrent.Eventually._
 import org.scalatest.concurrent.PatienceConfiguration.Timeout
 import org.scalatest.exceptions.TestFailedDueToTimeoutException
 import org.scalatest.time.Span
@@ -38,6 +39,7 @@ import org.apache.spark.sql.catalyst.encoders.{encoderFor, ExpressionEncoder, Ro
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.execution.streaming._
+import org.apache.spark.sql.streaming.StreamingQueryListener._
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.util.{Clock, ManualClock, SystemClock, Utils}
 
@@ -158,7 +160,8 @@ trait StreamTest extends QueryTest with SharedSQLContext with Timeouts {
   /** Starts the stream, resuming if data has already been processed. It must not be running. */
   case class StartStream(
       trigger: Trigger = ProcessingTime(0),
-      triggerClock: Clock = new SystemClock)
+      triggerClock: Clock = new SystemClock,
+      additionalConfs: Map[String, String] = Map.empty)
     extends StreamAction
 
   /** Advance the trigger clock's time manually. */
@@ -198,6 +201,24 @@ trait StreamTest extends QueryTest with SharedSQLContext with Timeouts {
     }
   }
 
+  class StreamManualClock(time: Long = 0L) extends ManualClock(time) with Serializable {
+    private var waitStartTime: Option[Long] = None
+
+    override def waitTillTime(targetTime: Long): Long = synchronized {
+      try {
+        waitStartTime = Some(getTimeMillis())
+        super.waitTillTime(targetTime)
+      } finally {
+        waitStartTime = None
+      }
+    }
+
+    def isStreamWaitingAt(time: Long): Boolean = synchronized {
+      waitStartTime == Some(time)
+    }
+  }
+
+
   /**
    * Executes the specified actions on the given streaming DataFrame and provides helpful
    * error messages in the case of failures or incorrect answers.
@@ -210,12 +231,13 @@ trait StreamTest extends QueryTest with SharedSQLContext with Timeouts {
       outputMode: OutputMode = OutputMode.Append)(actions: StreamAction*): Unit = {
 
     val stream = _stream.toDF()
+    val sparkSession = stream.sparkSession  // use the session in DF, not the default session
     var pos = 0
-    var currentPlan: LogicalPlan = stream.logicalPlan
     var currentStream: StreamExecution = null
     var lastStream: StreamExecution = null
     val awaiting = new mutable.HashMap[Int, Offset]() // source index -> offset to wait for
     val sink = new MemorySink(stream.schema, outputMode)
+    val resetConfValues = mutable.Map[String, Option[String]]()
 
     @volatile
     var streamDeathCause: Throwable = null
@@ -297,17 +319,33 @@ trait StreamTest extends QueryTest with SharedSQLContext with Timeouts {
          """.stripMargin)
     }
 
-    val testThread = Thread.currentThread()
     val metadataRoot = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
-
+    var manualClockExpectedTime = -1L
     try {
       startedTest.foreach { action =>
+        logInfo(s"Processing test stream action: $action")
         action match {
-          case StartStream(trigger, triggerClock) =>
+          case StartStream(trigger, triggerClock, additionalConfs) =>
             verify(currentStream == null, "stream already running")
+            verify(triggerClock.isInstanceOf[SystemClock]
+              || triggerClock.isInstanceOf[StreamManualClock],
+              "Use either SystemClock or StreamManualClock to start the stream")
+            if (triggerClock.isInstanceOf[StreamManualClock]) {
+              manualClockExpectedTime = triggerClock.asInstanceOf[StreamManualClock].getTimeMillis()
+            }
+
+            additionalConfs.foreach(pair => {
+              val value =
+                if (sparkSession.conf.contains(pair._1)) {
+                  Some(sparkSession.conf.get(pair._1))
+                } else None
+              resetConfValues(pair._1) = value
+              sparkSession.conf.set(pair._1, pair._2)
+            })
+
             lastStream = currentStream
             currentStream =
-              spark
+              sparkSession
                 .streams
                 .startQuery(
                   None,
@@ -328,14 +366,21 @@ trait StreamTest extends QueryTest with SharedSQLContext with Timeouts {
           case AdvanceManualClock(timeToAdd) =>
             verify(currentStream != null,
                    "can not advance manual clock when a stream is not running")
-            verify(currentStream.triggerClock.isInstanceOf[ManualClock],
+            verify(currentStream.triggerClock.isInstanceOf[StreamManualClock],
                    s"can not advance clock of type ${currentStream.triggerClock.getClass}")
-            val clock = currentStream.triggerClock.asInstanceOf[ManualClock]
+            val clock = currentStream.triggerClock.asInstanceOf[StreamManualClock]
+            assert(manualClockExpectedTime >= 0)
+
             // Make sure we don't advance ManualClock too early. See SPARK-16002.
-            eventually("ManualClock has not yet entered the waiting state") {
-              assert(clock.isWaiting)
+            eventually("StreamManualClock has not yet entered the waiting state") {
+              assert(clock.isStreamWaitingAt(manualClockExpectedTime))
             }
-            currentStream.triggerClock.asInstanceOf[ManualClock].advance(timeToAdd)
+
+            clock.advance(timeToAdd)
+            manualClockExpectedTime += timeToAdd
+            verify(clock.getTimeMillis() === manualClockExpectedTime,
+              s"Unexpected clock time after updating: " +
+                s"expecting $manualClockExpectedTime, current ${clock.getTimeMillis()}")
 
           case StopStream =>
             verify(currentStream != null, "can not stop a stream that is not running")
@@ -368,8 +413,6 @@ trait StreamTest extends QueryTest with SharedSQLContext with Timeouts {
               eventually("microbatch thread not stopped after termination with failure") {
                 assert(!currentStream.microBatchThread.isAlive)
               }
-              verify(thrownException.query.eq(currentStream),
-                s"incorrect query reference in exception")
               verify(currentStream.exception === Some(thrownException),
                 s"incorrect exception returned by query.exception()")
 
@@ -473,6 +516,12 @@ trait StreamTest extends QueryTest with SharedSQLContext with Timeouts {
       if (currentStream != null && currentStream.microBatchThread.isAlive) {
         currentStream.stop()
       }
+
+      // Rollback prev configuration values
+      resetConfValues.foreach {
+        case (key, Some(value)) => sparkSession.conf.set(key, value)
+        case (key, None) => sparkSession.conf.unset(key)
+      }
     }
   }
 
@@ -551,7 +600,6 @@ trait StreamTest extends QueryTest with SharedSQLContext with Timeouts {
     addCheck()
     testStream(ds)(actions: _*)
   }
-
 
   object AwaitTerminationTester {
 
